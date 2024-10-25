@@ -1,112 +1,211 @@
-import os
-import json
+from flask import Flask, request, jsonify
 import sqlite3
 import pandas as pd
+import json
+from datetime import datetime
+from creative_summary import NewsClusteringSummarizer
 from dotenv import load_dotenv
-from creative_summary import NewsClusteringSummarizer  
+import os
+import webbrowser
 
 load_dotenv()
+app = Flask(__name__)
 
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+class DatabaseConnection:
+    def __init__(self, db_path):
+        self.db_path = db_path
 
-# 1. 키워드 입력 함수
-def get_keyword():
-    keyword = input("검색할 키워드를 입력하세요: ")
-    return keyword
+    def __enter__(self):
+        self.conn = sqlite3.connect(self.db_path)
+        return self.conn
 
-# 2. 데이터베이스에서 기사 검색 함수
-def search_news_by_keyword(keyword, db_connection):
-    query = f"""
-        SELECT date, title, content, keyword
-        FROM news
-        WHERE keyword LIKE '%{keyword}%'
-    """
-    df = pd.read_sql_query(query, db_connection)
-    return df
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.conn.close()
 
-# 3. 검색 결과를 날짜별로 정렬하고, impect_point를 찾는 함수
-def process_results(df):
-    if df.empty:
-        print("검색 결과가 없습니다.")
-        return None, None
+class NewsTimelineService:
+    def __init__(self, db_path, api_key):
+        self.db_path = db_path
+        self.summarizer = NewsClusteringSummarizer(api_key=api_key)
 
-    # 날짜별로 정렬
-    df['date'] = pd.to_datetime(df['date'])
-    sorted_df = df.sort_values(by='date')
+    def search_news(self, keyword):
+        with DatabaseConnection(self.db_path) as conn:
+            # SQL Injection 방지를 위한 파라미터화된 쿼리
+            query = """
+                SELECT date, title, content
+                FROM news
+                WHERE content LIKE ?
+            """
+            df = pd.read_sql_query(query, conn, params=[f'%{keyword}%'])
+            return df
 
-    # 날짜별 기사 수 세기
-    date_counts = sorted_df['date'].value_counts()
+    def process_results(self, df):
+        if df.empty:
+            return None, None
 
-    # 기사 수가 10개 이상인 날짜(impact_point)
-    impact_dates = date_counts[date_counts >= 10].index
-
-    # impact_point 날짜의 기사만 따로 추출
-    impact_df = sorted_df[sorted_df['date'].isin(impact_dates)]
-    
-    return sorted_df, impact_df
-
-# 4. 날짜별로 기사를 요약하는 함수
-def summarize_articles_by_date(impact_df):
-    # 기사들을 날짜별로 그룹화하여 JSON 형태로 변환
-    articles_by_date = {}
-    for date, group in impact_df.groupby(impact_df['date'].dt.date):
-        articles_by_date[str(date)] = group[['title', 'content']].to_dict(orient='records')
-    
-    # NewsClusteringSummarizer를 사용하여 요약 생성
-    summarizer = NewsClusteringSummarizer(api_key=OPENAI_API_KEY)
-    summaries = {}
-    
-    for date, articles in articles_by_date.items():
-        results = summarizer.process_articles(articles)
-        summaries[date] = results
-    
-    return summaries
-
-# 5. 요약된 결과를 데이터베이스에 저장하는 함수
-def save_summaries_to_db(summaries, db_connection):
-    summary_list = []
-    
-    for date, clusters in summaries.items():
-        for cluster in clusters:
-            summary_list.append({
-                'date': date,
-                'summary': cluster['summary'],
-                'article_count': cluster['article_count'],
-                'processed_at': cluster['processed_at'],
-                'titles': json.dumps(cluster['titles'])  # 제목을 JSON 문자열로 변환하여 저장
-            })
-
-    # 요약 데이터를 pandas DataFrame으로 변환
-    summary_df = pd.DataFrame(summary_list)
-    
-    # 데이터베이스의 'timeline_table'에 저장
-    summary_df.to_sql('timeline_table', db_connection, if_exists='append', index=False)
-
-# 전체 흐름 실행
-def main():
-    # 데이터베이스 연결 설정
-    db_connection = sqlite3.connect('news_database.db')
-    
-    # 1. 키워드 입력 받기
-    keyword = get_keyword()
-    
-    # 2. 키워드로 기사 검색
-    results_df = search_news_by_keyword(keyword, db_connection)
-    
-    # 3. 검색 결과를 날짜별로 정렬하고, impact_point 기사 찾기
-    sorted_df, impact_df = process_results(results_df)
-    
-    if impact_df is not None:
-        # 4. impact_point 기사들을 요약
-        summaries = summarize_articles_by_date(impact_df)
+        df['date'] = pd.to_datetime(df['date'])
+        sorted_df = df.sort_values(by='date')
+        date_counts = sorted_df['d ate'].value_counts()
+        impact_dates = date_counts[date_counts >= 10].index
+        impact_df = sorted_df[sorted_df['date'].isin(impact_dates)]
         
-        # 5. 요약된 결과를 DB에 저장
-        save_summaries_to_db(summaries, db_connection)
-        print("요약된 결과가 timeline_table에 저장되었습니다.")
-    
-    # 데이터베이스 연결 종료
-    db_connection.close()
+        return sorted_df, impact_df
 
-# Python 스크립트를 실행할 때 main 함수가 호출되도록 설정
-if __name__ == "__main__":
-    main()
+    def summarize_articles(self, impact_df):
+        articles_by_date = {}
+        for date, group in impact_df.groupby(impact_df['date'].dt.date):
+            articles_by_date[str(date)] = group[['title', 'content']].to_dict(orient='records')
+        
+        summaries = {}
+        for date, articles in articles_by_date.items():
+            results = self.summarizer.process_articles(articles)
+            if results:
+                summaries[date] = results
+            else:
+                summaries[date] = [{
+                    'title_summary': '요약 결과 없음',
+                    'content_summary': '요약 결과를 생성할 수 없습니다.',
+                    'article_count': len(articles),
+                    'titles': [article['title'] for article in articles]
+                }]
+        
+        return summaries
+
+    def save_summaries(self, summaries):
+        with DatabaseConnection(self.db_path) as conn:
+            # 타임라인 테이블이 없는 경우 생성
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS timeline_table (
+                    date TEXT,
+                    title_summary TEXT,
+                    content_summary TEXT,
+                    article_count INTEGER,
+                    processed_at TEXT,
+                    titles TEXT
+                )
+            ''')
+            conn.commit()
+            
+            # 중복 방지를 위해 기존 데이터 삭제
+            dates = list(summaries.keys())
+            cursor.execute(
+                "DELETE FROM timeline_table WHERE date IN ({})".format(
+                    ','.join(['?'] * len(dates))
+                ), 
+                dates
+            )
+            
+            summary_list = []
+            for date, clusters in summaries.items():
+                for cluster in clusters:
+                    summary_list.append({
+                        'date': date,
+                        'title_summary': cluster['title_summary'],
+                        'content_summary': cluster['content_summary'],
+                        'article_count': cluster['article_count'],
+                        'processed_at': datetime.now().isoformat(),
+                        'titles': json.dumps(cluster['titles'])
+                    })
+
+            summary_df = pd.DataFrame(summary_list)
+            summary_df.to_sql('timeline_table', conn, if_exists='append', index=False)
+            conn.commit()
+
+@app.route('/api/timeline', methods=['POST'])
+def create_timeline():
+    try:
+        data = request.get_json()
+        keyword = data.get('keyword')
+        
+        if not keyword:
+            return jsonify({'error': '키워드가 필요합니다.'}), 400
+
+        service = NewsTimelineService(
+            db_path='news_data.db',
+            api_key=os.getenv('OPENAI_API_KEY')
+        )
+
+        # 뉴스 검색
+        df = service.search_news(keyword)
+        
+        # 임팩트 포인트 처리
+        _, impact_df = service.process_results(df)
+        
+        if impact_df is None or impact_df.empty:
+            return jsonify({'message': '검색 결과가 없습니다.'}), 404
+
+        # 요약 생성
+        summaries = service.summarize_articles(impact_df)
+        
+        # DB 저장
+        service.save_summaries(summaries)
+
+        return jsonify({
+            'message': '타임라인이 생성되었습니다.',
+            'timeline': summaries
+        }), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    
+@app.route('/api/search', methods=['GET'])
+def search_articles():
+    try:
+        keyword = request.args.get('keyword')
+        
+        if not keyword:
+            return jsonify({'error': '키워드가 필요합니다.'}), 400
+
+        service = NewsTimelineService(
+            db_path='news_data.db',
+            api_key=os.getenv('OPENAI_API_KEY')
+        )
+
+        # 뉴스 검색
+        df = service.search_news(keyword)
+        
+        if df.empty:
+            return jsonify({'message': '검색 결과가 없습니다.'}), 404
+
+        # 검색 결과를 JSON으로 변환
+        results = df.to_dict(orient='records')
+
+        return jsonify({
+            'message': f'"{keyword}" 키워드로 검색된 결과입니다.',
+            'results': results
+        }), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/timeline', methods=['GET'])
+def get_timeline():
+    try:
+        date = request.args.get('date')
+        
+        with DatabaseConnection('news_data.db') as conn:
+            query = "SELECT * FROM timeline_table"
+            params = []
+            
+            if date:
+                query += " WHERE date = ?"
+                params.append(date)
+                
+            query += " ORDER BY date DESC"
+            
+            df = pd.read_sql_query(query, conn, params=params)
+            
+            if df.empty:
+                return jsonify({'message': '데이터가 없습니다.'}), 404
+                
+            timeline = df.to_dict(orient='records')
+            return jsonify({'timeline': timeline}), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    port = 5000
+    url = f"http://127.0.0.1:{port}/"
+    webbrowser.open(url)
+    app.run(debug=True, port=port)

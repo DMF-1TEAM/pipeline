@@ -86,3 +86,9 @@ $RECYCLE.BIN/
 
 *.venv
 /venv
+
+*.news_data.db
+/news_data.db
+
+*.sample_data.py
+/sample_data.py
